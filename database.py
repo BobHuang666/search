@@ -143,23 +143,29 @@ def add_image(session: Session, path: str, modify_time: datetime.datetime, check
     session.commit()
 
 
-def add_video(session: Session, path: str, modify_time: datetime.datetime, checksum: str, frame_time_features_generator):
+# database.py
+
+def add_video(session: Session, path: str, modify_time: datetime.datetime, checksum: str, frame_data_generator):
     """
-    将处理后的视频数据入库
-    :param session: Session, 数据库session
-    :param path: str, 视频路径
-    :param modify_time: datetime, 文件修改时间
-    :param checksum: str, 文件hash
-    :param frame_time_features_generator: 返回(帧序列号,特征)元组的迭代器
+    入库视频数据（修正后的版本）
+    :param frame_data_generator: 生成 (frame_time, features, current_time, transcript) 的生成器
     """
-    # 使用 bulk_save_objects 一次性提交，因此处理至一半中断不会导致下次扫描时跳过
-    logger.info(f"新增文件：{path}")
-    video_list = (
+    logger.info(f"新增视频文件：{path}")
+    
+    video_list = [
         Video(
-            path=path, modify_time=modify_time, frame_time=frame_time, features=features, checksum=checksum
+            path=path,
+            modify_time=modify_time,
+            frame_time=frame_time,       # int
+            features=features,          # bytes
+            checksum=checksum,
+            # 根据模型添加其他字段如 transcript 等
         )
-        for frame_time, features in frame_time_features_generator
-    )
+        # 重要！这里解包的是单个帧的数据
+        for frame_time, features, _, _ in frame_data_generator
+    ]
+
+    # 批量入库
     session.bulk_save_objects(video_list)
     session.commit()
 

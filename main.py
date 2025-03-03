@@ -8,7 +8,7 @@ from flask import Flask, abort, jsonify, redirect, request, send_file, session, 
 from database import get_image_path_by_id, is_video_exist, get_pexels_video_count
 from init import *
 from models import DatabaseSession, DatabaseSessionPexelsVideo
-from process_assets import match_text_and_image, process_image, process_text
+from process_assets import match_text_and_image_with_transcription, process_image, process_text
 from scan import Scanner
 from search import (
     clean_cache,
@@ -171,7 +171,7 @@ def api_match():
     elif search_type == 3:  # 以图搜视频
         results = search_video_by_image(upload_file_path, image_threshold)
     elif search_type == 4:  # 图文相似度匹配
-        score = match_text_and_image(process_text(data["positive"]), process_image(upload_file_path)) * 100
+        score = match_text_and_image_with_transcription(process_text(data["positive"]), process_image(upload_file_path), data["transcription"]) * 100
         return jsonify({"score": "%.2f" % score})
     elif search_type == 5:  # 以图搜图(图片是数据库中的)
         results = search_image_by_image(img_id, image_threshold)

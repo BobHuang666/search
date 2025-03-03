@@ -14,13 +14,19 @@ from transformers import CLIPModel, CLIPProcessor
 
 from config import *
 
+import subprocess
+import whisper
+from moviepy import VideoFileClip
+
 logger = logging.getLogger(__name__)
 
 logger.info("Loading CLIP model...")
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(torch.device(DEVICE))
+clip_model.eval()
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 logger.info("CLIP model loaded.")
 
+whisper_model = whisper.load_model("base")
 
 def get_image_feature(images):
     """
@@ -108,6 +114,32 @@ def process_web_image(url):
     feature = get_image_feature(image)
     return feature
 
+def extract_audio_from_video(video_path, audio_path):
+    # command = [
+    #     "ffmpeg", "-i", video_path, 
+    #     "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", 
+    #     audio_path
+    # ]
+    # subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if(os.path.exists(audio_path)):#如果文件已经存在，则不再提取
+        return
+    video = VideoFileClip(video_path)
+    audio_clip = video.audio
+    audio_clip.write_audiofile(audio_path, codec='pcm_s16le')
+
+
+def get_audio_transcript_for_time(current_time, audio_segments):
+    """
+    获取当前时间对应的转录文本
+    :param current_time: 当前视频帧的时间戳
+    :param audio_segments: Whisper模型的转录结果片段
+    :return: 对应时间戳的转录文本
+    """
+    for segment in audio_segments:
+        if segment["start"] <= current_time <= segment["end"]:
+            return segment["text"]
+    return ""  # 如果找不到匹配的转录文本
+
 
 def get_frames(video: cv2.VideoCapture):
     """ 
@@ -129,6 +161,7 @@ def get_frames(video: cv2.VideoCapture):
         ret, frame = video.read()
         if not ret:
             break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         ids.append(current_frame // frame_rate)
         frames.append(frame)
         if len(frames) == SCAN_PROCESS_BATCH_SIZE:
@@ -140,26 +173,54 @@ def get_frames(video: cv2.VideoCapture):
     yield ids, frames
 
 
+# process_assets.py
+
 def process_video(path):
     """
     处理视频并返回处理完成的数据
-    返回一个生成器，每调用一次则返回视频下一个帧的数据
-    :param path: string, 视频路径
-    :return: [int, <class 'numpy.nparray'>], [当前是第几帧（被采集的才算），图片特征]
+    :param path: 视频路径
+    :return: 生成器，每次生成 (frame_time, features, current_time, transcript) 的单个帧数据
     """
     logger.info(f"处理视频中：{path}")
     try:
+        # 提取音频并转录
+        audio_path = path.replace('.mp4', '.wav')
+        extract_audio_from_video(path, audio_path)
+        result = whisper_model.transcribe(audio_path)
+
+        # 获取视频帧
         video = cv2.VideoCapture(path)
-        for ids, frames in get_frames(video):
-            features = get_image_feature(frames)  # 使用CLIP来提取帧的特征
-            if features is None:
-                logger.warning("features is None")
-                continue
-            for id, feature in zip(ids, features):
-                yield id, feature
+        frame_rate = round(video.get(cv2.CAP_PROP_FPS))
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        for current_frame in trange(0, total_frames, FRAME_INTERVAL * frame_rate, desc="Processing video frames"):
+            # 定位到当前帧
+            video.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+            ret, frame = video.read()
+            if not ret:
+                break
+
+            # 提取帧特征
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            feature = get_image_feature([frame])  # CLIP提取特征
+            feature_bytes = feature.tobytes()     # 转为字节
+
+            # 计算时间戳和转录文本
+            current_time = current_frame / frame_rate
+            transcript = get_audio_transcript_for_time(current_time, result["segments"])
+
+            # 每次生成单个帧的数据
+            yield (
+                current_frame // frame_rate,  # frame_time (int)
+                feature_bytes,                 # features (bytes)
+                current_time,                  # 时间戳 (float)
+                transcript                     # 文本 (str)
+            )
+
+        video.release()
     except Exception as e:
         logger.warning(f"处理视频出错：{path} {repr(e)}")
-        return
+        traceback.print_exc()
 
 
 def process_text(input_text):
@@ -179,21 +240,22 @@ def process_text(input_text):
         traceback.print_stack()
     return feature
 
-
-def match_text_and_image(text_feature, image_feature):
+def match_text_and_image_with_transcription(text_feature, image_feature, transcription):
     """
-    匹配文字和图片，返回余弦相似度
-    :param text_feature: <class 'numpy.nparray'>, 文字特征
+    匹配文字和图片，返回余弦相似度。这里的text_feature不仅包含转录文本，还可能包含查询文本。
+    :param text_feature: <class 'numpy.nparray'>, 文字特征（包括转录文本）
     :param image_feature: <class 'numpy.nparray'>, 图片特征
+    :param transcription: string, 转录文本
     :return: <class 'numpy.nparray'>, 文字和图片的余弦相似度，shape=(1, 1)
     """
-    score = (image_feature @ text_feature.T) / (
-            np.linalg.norm(image_feature) * np.linalg.norm(text_feature)
+    # 提取转录文本的特征
+    transcription_feature = process_text(transcription)
+    combined_text_feature = np.concatenate([text_feature, transcription_feature], axis=1)
+
+    # 计算余弦相似度
+    score = (image_feature @ combined_text_feature.T) / (
+            np.linalg.norm(image_feature) * np.linalg.norm(combined_text_feature)
     )
-    # 上面的计算等价于下面三步：
-    # new_image_feature = image_feature / np.linalg.norm(image_feature)
-    # new_text_feature = text_feature / np.linalg.norm(text_feature)
-    # score = (new_image_feature @ new_text_feature.T)
     return score
 
 

@@ -188,6 +188,7 @@ def search_video_by_feature(
             for start_index, end_index in index_pairs:
                 score = max(scores[start_index: end_index + 1])
                 start_time, end_time = get_video_range(start_index, end_index, scores, frame_times)
+                # 将音频转录文本加入返回结果
                 return_list.append({
                     "url": "api/get_video/%s" % base64.urlsafe_b64encode(path.encode()).decode()
                            + "#t=%.1f,%.1f" % (start_time, end_time),
@@ -195,6 +196,7 @@ def search_video_by_feature(
                     "score": float(score),
                     "start_time": start_time,
                     "end_time": end_time,
+                    "transcription": " ".join([transcriptions[i] for i in range(start_index, end_index+1)])
                 })
     logger.info("查询使用时间：%.2f" % (time.time() - t0))
     return_list = sorted(return_list, key=lambda x: x["score"], reverse=True)
