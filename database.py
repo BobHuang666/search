@@ -1,3 +1,4 @@
+'''database.py'''
 import datetime
 import logging
 
@@ -103,15 +104,17 @@ def get_video_paths(session: Session, filter_path: str = None, start_time: int =
 
 
 def get_frame_times_features_by_path(session: Session, path: str):
-    """获取路径对应视频的features"""
-    l = (
-        session.query(Video.frame_time, Video.features)
+    """获取路径对应视频的features和transcriptions"""
+    results = (
+        session.query(Video.frame_time, Video.features, Video.transcription)
         .filter_by(path=path)
         .order_by(Video.frame_time)
         .all()
     )
-    frame_times, features = zip(*l)
-    return frame_times, features
+    if not results:
+        return [], [], []
+    frame_times, features, transcriptions = zip(*results)
+    return frame_times, features, transcriptions
 
 
 def get_video_count(session: Session):
@@ -159,10 +162,9 @@ def add_video(session: Session, path: str, modify_time: datetime.datetime, check
             frame_time=frame_time,       # int
             features=features,          # bytes
             checksum=checksum,
-            # 根据模型添加其他字段如 transcript 等
+            transcription=transcript
         )
-        # 重要！这里解包的是单个帧的数据
-        for frame_time, features, _, _ in frame_data_generator
+        for frame_time, features, _, transcript in frame_data_generator
     ]
 
     # 批量入库

@@ -1,3 +1,4 @@
+'''main.py'''
 import shutil
 import threading
 from functools import wraps

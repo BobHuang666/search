@@ -54,6 +54,7 @@ class Video(BaseModel):
     modify_time = Column(DateTime)  # 文件修改时间
     features = Column(BINARY)  # 文件预处理后的二进制数据
     checksum = Column(String(40), index=True)  # 文件SHA1
+    transcription = Column(String(4096))  # 转录文本
 
 
 class PexelsVideo(BaseModelPexelsVideo):
