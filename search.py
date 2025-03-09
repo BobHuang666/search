@@ -180,27 +180,56 @@ def search_video_by_feature(
     t0 = time.time()
     return_list = []
     with DatabaseSession() as session:
-        for path in get_video_paths(session, filter_path, modify_time_start, modify_time_end):  # 逐个视频比对
-            frame_times, features,transcriptions = get_frame_times_features_by_path(session, path)
+        for path in get_video_paths(session, filter_path, modify_time_start, modify_time_end):  # 逐个视频处理
+            frame_times, features, transcriptions = get_frame_times_features_by_path(session, path)
+            if not frame_times:
+                continue  # 无帧数据，跳过
             features = np.frombuffer(b"".join(features), dtype=np.float32).reshape(len(features), -1)
-            scores = match_batch(positive_feature, negative_feature, features, positive_threshold, negative_threshold)
-            index_pairs = get_index_pairs(scores)
-            for start_index, end_index in index_pairs:
-                score = max(scores[start_index: end_index + 1])
-                start_time, end_time = get_video_range(start_index, end_index, scores, frame_times)
-                # 将音频转录文本加入返回结果
+            max_time = max(frame_times)
+            num_segments = int(np.ceil(max_time / 15)) # 每个视频片段的时长15s
+            
+            for seg_num in range(num_segments):
+                seg_start = seg_num * 15
+                seg_end = (seg_num + 1) * 15
+                # 获取当前片段内的帧索引
+                indices = [i for i, t in enumerate(frame_times) if seg_start <= t < seg_end]
+                if not indices:
+                    continue  # 无帧，跳过
+                # 计算平均特征
+                avg_feature = np.mean(features[indices], axis=0)
+                # 计算得分
+                score = match_single(positive_feature, negative_feature, avg_feature, 
+                                    positive_threshold, negative_threshold)
+                if score <= 0:
+                    continue  # 未达阈值，跳过
+                # 处理转录文本
+                segment_transcript = " ".join([transcriptions[i] for i in indices if transcriptions[i]])
+                # 生成视频URL
+                base64_path = base64.urlsafe_b64encode(path.encode()).decode()
+                url = f"api/get_video/{base64_path}#t={seg_start},{seg_end}"
+                # 添加到结果
                 return_list.append({
-                    "url": "api/get_video/%s" % base64.urlsafe_b64encode(path.encode()).decode()
-                           + "#t=%.1f,%.1f" % (start_time, end_time),
+                    "url": url,
                     "path": path,
                     "score": float(score),
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "transcription": " ".join([transcriptions[i] for i in range(start_index, end_index+1)])
+                    "start_time": seg_start,
+                    "end_time": seg_end,
+                    "transcription": segment_transcript,
+                    "frame_count": len(indices)
                 })
-    logger.info("查询使用时间：%.2f" % (time.time() - t0))
-    return_list = sorted(return_list, key=lambda x: x["score"], reverse=True)
-    return return_list
+    
+    logger.info("视频搜索用时：%.2f秒" % (time.time() - t0))
+    return sorted(return_list, key=lambda x: x["score"], reverse=True)
+
+def match_single(positive_feature, negative_feature, feature, pos_thresh, neg_thresh):
+    """
+    计算单个特征向量的匹配得分
+    """
+    score = match_batch(positive_feature, negative_feature, feature.reshape(1, -1), pos_thresh, neg_thresh)
+    if (positive_feature is None or score >= pos_thresh) and \
+       (negative_feature is None or score <= neg_thresh):
+        return score
+    return 0
 
 
 @lru_cache(maxsize=CACHE_SIZE)
