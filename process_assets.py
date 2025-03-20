@@ -3,7 +3,6 @@
 import concurrent.futures
 import logging
 import traceback
-
 import cv2
 import numpy as np
 import requests
@@ -13,10 +12,7 @@ from tqdm import trange
 from transformers import CLIPModel, CLIPProcessor
 from ultralytics import YOLO
 from concurrent.futures import ThreadPoolExecutor
-
 from config import *
-
-import subprocess
 import whisper
 from moviepy import VideoFileClip
 
@@ -28,9 +24,10 @@ clip_model.eval()
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 logger.info("CLIP model loaded.")
 
-logger.info("Loading YOLOv8 model...")
-yolo_model = YOLO('yolov8s.pt')  # yolov8n/s/m/l/x
-logger.info("YOLOv8 model loaded.")
+logger.info("Loading EAST model...")
+EAST_MODEL_PATH = "frozen_east_text_detection.pb"
+east_net = cv2.dnn.readNet(EAST_MODEL_PATH)
+logger.info("EAST model loaded.")
 
 whisper_model = whisper.load_model("base")
 
@@ -72,78 +69,6 @@ def get_image_data(path: str, ignore_small_images: bool = True):
         return None
 
 
-def process_image(path, ignore_small_images=True):
-    """
-    修改后的图片处理流程：目标检测 -> 关键区域裁剪 -> 多区域特征融合
-    """
-    # 读取原始图片
-    image = get_image_data(path, ignore_small_images)
-    if image is None:
-        return None
-
-    # 使用YOLOv8进行目标检测
-    try:
-        # 转换为RGB格式
-        yolo_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if isinstance(image, np.ndarray) else image
-        results = yolo_model(yolo_image, verbose=False)[0]  # 单图推理
-        
-        # 解析检测结果
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confidences = results.boxes.conf.cpu().numpy()
-        class_ids = results.boxes.cls.cpu().numpy().astype(int)
-        
-        # 过滤设置：置信度阈值+关键类别筛选
-        DETECTION_CONF_THRESHOLD = 0.5
-        KEY_CLASSES = [0, 2, 3, 5, 7]  # person,car,motorbike,truck,bus等关键类
-        
-        valid_regions = []
-        for box, conf, cls_id in zip(boxes, confidences, class_ids):
-            if conf > DETECTION_CONF_THRESHOLD and cls_id in KEY_CLASSES:
-                # 扩展检测框范围（增加10%上下文）
-                x1, y1, x2, y2 = box
-                w = x2 - x1
-                h = y2 - y1
-                new_x1 = max(0, x1 - w * 0.1)
-                new_y1 = max(0, y1 - h * 0.1)
-                new_x2 = min(image.shape[1], x2 + w * 0.1)
-                new_y2 = min(image.shape[0], y2 + h * 0.1)
-                
-                valid_regions.append((new_x1, new_y1, new_x2, new_y2))
-    except Exception as e:
-        logger.error(f"目标检测失败: {str(e)}")
-        valid_regions = []
-
-    # 如果没有检测到关键物体，使用整图特征
-    if not valid_regions:
-        return get_image_feature([image])[0]
-
-    # 提取多区域特征并融合
-    features = []
-    for region in valid_regions:
-        x1, y1, x2, y2 = map(int, region)
-        crop_img = image[y1:y2, x1:x2]
-        
-        # 确保裁剪区域有效
-        if crop_img.size == 0:
-            continue
-            
-        # 转换为PIL格式并提取特征
-        pil_img = Image.fromarray(cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB))
-        feature = get_image_feature([pil_img])
-        if feature is not None:
-            features.append(feature[0])
-
-    # 如果没有有效特征，回退到整图
-    if not features:
-        return get_image_feature([image])[0]
-
-    # 加权融合（使用检测置信度作为权重）
-    weights = [conf for _, conf in zip(boxes, confidences)][:len(features)]
-    weighted_features = np.average(features, axis=0, weights=weights)
-    
-    return weighted_features
-
-
 def process_web_image(url):
     """
     处理网络图片，返回图片特征
@@ -158,121 +83,143 @@ def process_web_image(url):
     feature = get_image_feature(image)
     return feature
 
-# def process_image(path, ignore_small_images=True):
-#     """
-#     修改后的单图片处理：支持本地/网络路径的统一处理
-#     """
-#     # 统一获取图片数据
-#     if path.startswith(('http://', 'https://')):
-#         image = process_web_image(path, return_image=True)
-#     else:
-#         image = get_image_data(path, ignore_small_images)
-    
-#     if image is None:
-#         return None
-    
-#     # 执行目标检测与特征融合
-#     return detect_and_fuse_features(image)
+def decode_east_predictions(scores, geometry, conf_threshold):
+    """
+    根据 EAST 模型的输出解码预测结果
+    返回检测框列表和置信度列表
+    """
+    detections = []
+    confidences = []
+    # scores.shape: (1, 1, numRows, numCols)
+    (numRows, numCols) = scores.shape[2:4]
+    for y in range(numRows):
+        scoresData = scores[0, 0, y]
+        xData0 = geometry[0, 0, y]
+        xData1 = geometry[0, 1, y]
+        xData2 = geometry[0, 2, y]
+        xData3 = geometry[0, 3, y]
+        anglesData = geometry[0, 4, y]
+        for x in range(numCols):
+            score = scoresData[x]
+            if score < conf_threshold:
+                continue
+            # 计算检测框在特征图中的偏移量
+            offsetX, offsetY = x * 4.0, y * 4.0
+            angle = anglesData[x]
+            cos = np.cos(angle)
+            sin = np.sin(angle)
+            h = xData0[x] + xData2[x]
+            w = xData1[x] + xData3[x]
+            endX = int(offsetX + (cos * xData1[x]) + (sin * xData2[x]))
+            endY = int(offsetY - (sin * xData1[x]) + (cos * xData2[x]))
+            startX = int(endX - w)
+            startY = int(endY - h)
+            detections.append((startX, startY, endX, endY))
+            confidences.append(float(score))
+    return detections, confidences
+
+def process_image(path, ignore_small_images=True):
+    """
+    修改后的图片处理流程：
+    使用 EAST 模型进行文本区域检测 -> 将所有检测区域融合绘制到原图上 -> 保存融合图像 -> 提取融合图像特征
+    返回一个列表，每个元素为 (新图片路径, 特征向量)
+    """
+    # 读取原始图片
+    image = get_image_data(path, ignore_small_images)
+    if image is None:
+        return None
+
+    # EAST检测参数
+    conf_threshold = 0.5
+    nms_threshold = 0.4
+    valid_regions = []
+
+    try:
+        # 图像预处理：将图像调整到大小为32的倍数，EAST要求尺寸必须为32的倍数
+        orig = image.copy()
+        (H, W) = image.shape[:2]
+        newW = (W // 32) * 32
+        newH = (H // 32) * 32
+        rW = W / float(newW)
+        rH = H / float(newH)
+        resized = cv2.resize(image, (newW, newH))
+        
+        # 构造blob并前向传播
+        blob = cv2.dnn.blobFromImage(resized, 1.0, (newW, newH), (123.68, 116.78, 103.94), swapRB=True, crop=False)
+        east_net.setInput(blob)
+        # EAST模型有两个输出：scores和几何信息
+        (scores, geometry) = east_net.forward(["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"])
+        
+        # 解码检测结果
+        boxes, confidences = decode_east_predictions(scores, geometry, conf_threshold)
+        # 非极大值抑制
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
+        
+        if len(indices) > 0:
+            for i in indices.flatten():
+                (startX, startY, endX, endY) = boxes[i]
+                # 将检测框还原到原始图像尺寸
+                startX = int(startX * rW)
+                startY = int(startY * rH)
+                endX = int(endX * rW)
+                endY = int(endY * rH)
+                # 限制在图像范围内
+                startX = max(0, startX)
+                startY = max(0, startY)
+                endX = min(W, endX)
+                endY = min(H, endY)
+                # 过滤掉无效区域
+                if endX - startX > 0 and endY - startY > 0:
+                    valid_regions.append((startX, startY, endX, endY))
+    except Exception as e:
+        logger.error(f"文本检测失败: {str(e)}")
+        valid_regions = []
+
+    # 复制原图用于绘制检测区域（融合图像）
+    fused_image = image.copy()
+    if valid_regions:
+        # 在融合图上绘制所有检测到的区域，颜色和线宽可根据需要调整
+        for (x1, y1, x2, y2) in valid_regions:
+            cv2.rectangle(fused_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    # 如果没有检测到区域，则直接使用原图
+
+    # 提取融合图像的特征，转换为PIL格式并注意颜色顺序转换（BGR转RGB）
+    pil_img = Image.fromarray(cv2.cvtColor(fused_image, cv2.COLOR_BGR2RGB))
+    full_feature = get_image_feature([pil_img])
+    new_images_with_features = []
+    if full_feature is not None:
+        new_images_with_features.append((path, full_feature[0]))
+    else:
+        # 如果特征提取失败，则返回原始图像和特征（或做其他处理）
+        new_images_with_features.append((path, None))
+
+    return new_images_with_features
 
 def process_images(path_list, ignore_small_images=True):
     """
-    批量图片处理函数（无进度条版）
+    批量图片处理函数（单线程版）
+    对每个图片文件调用 process_image，得到多个新图片路径及对应的特征，
+    最终返回所有新图片路径列表和对应特征列表
     :param path_list: 图片路径列表
     :param ignore_small_images: 是否忽略小尺寸图片
-    :return: (有效路径列表, 特征矩阵)
+    :return: (新图片路径列表, 特征矩阵)
     """
     valid_paths = []
     features = []
-    
-    # 使用线程池并行处理
-    with ThreadPoolExecutor(max_workers=IMAGE_PROCESS_WORKERS) as executor:
-        # 提交所有任务
-        futures = {
-            executor.submit(process_image, path, ignore_small_images): path
-            for path in path_list
-        }
-        
-        # 收集结果
-        for future in futures:
-            path = futures[future]
-            try:
-                feature = future.result()
-                if feature is not None:
-                    valid_paths.append(path)
-                    features.append(feature)
-            except Exception as e:
-                logger.warning(f"图片处理失败 {path}: {str(e)}")
-                continue
-    
-    return valid_paths, np.array(features) if features else None
 
-# 新增通用特征处理函数
-def detect_and_fuse_features(image):
-    """
-    统一的目标检测与特征融合管道
-    """
-    # try:
-    # 格式统一化处理
-    if isinstance(image, Image.Image):
-        image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    elif isinstance(image, np.ndarray):
-        image = image.copy()
-    else:
-        raise ValueError("不支持的图片格式")
-    
-    # 执行目标检测
-    results = yolo_model(image, verbose=False)[0]
-    boxes = results.boxes.xyxy.cpu().numpy()
-    confidences = results.boxes.conf.cpu().numpy()
-    class_ids = results.boxes.cls.cpu().numpy().astype(int)
-    
-    # 过滤并处理检测结果
-    valid_regions = []
-    for box, conf, cls_id in zip(boxes, confidences, class_ids):
-        if conf > DETECTION_CONF_THRESHOLD and cls_id in KEY_CLASSES:
-            # 动态扩展检测框（根据物体尺寸调整）
-            x1, y1, x2, y2 = box
-            w, h = x2 - x1, y2 - y1
-            expand_w = w * (0.1 + 0.05 * (1 - conf))  # 置信度越低扩展越多
-            expand_h = h * (0.1 + 0.05 * (1 - conf))
-            
-            new_box = [
-                max(0, x1 - expand_w),
-                max(0, y1 - expand_h),
-                min(image.shape[1], x2 + expand_w),
-                min(image.shape[0], y2 + expand_h)
-            ]
-            valid_regions.append((new_box, conf))
-    
-    # 多区域特征提取
-    if valid_regions:
-        features = []
-        for (x1, y1, x2, y2), conf in valid_regions:
-            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-            crop = image[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-            
-            # 使用CLIP提取特征
-            pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-            feature = get_image_feature([pil_img])
-            if feature is not None:
-                features.append(feature[0] * conf)  # 置信度加权
-        
-        # 特征融合（加权平均）
-        if features:
-            return np.mean(features, axis=0)
-    
-    # 回退到整图特征
-    pil_full = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    return get_image_feature([pil_full])[0]
-    
-    # except Exception as e:
-    #     logger.error(f"特征处理失败: {str(e)}")
-    #     # 紧急回退机制
-    #     if isinstance(image, np.ndarray):
-    #         pil_img = Image.fromarray(image)
-    #     return get_image_feature([pil_img])[0] if pil_img else None
+    for path in path_list:
+        try:
+            # process_image 返回的是列表，每个元素为 (新图片路径, 特征向量)
+            new_entries = process_image(path, ignore_small_images)
+            if new_entries is not None:
+                for new_path, feat in new_entries:
+                    valid_paths.append(new_path)
+                    features.append(feat)
+        except Exception as e:
+            logger.warning(f"图片处理失败 {path}: {str(e)}")
+            continue
+
+    return valid_paths, np.array(features) if features else None
 
 
 def extract_audio_from_video(video_path, audio_path):

@@ -17,7 +17,7 @@ from database import (
     add_image,
 )
 from models import create_tables, DatabaseSession
-from process_assets import process_images, process_video
+from process_assets import process_image, process_video
 from search import clean_cache
 from utils import get_file_hash
 
@@ -161,15 +161,21 @@ class Scanner:
                 self.assets.add(str(file))
 
     def handle_image_batch(self, session, image_batch_dict):
-        path_list, features_list = process_images(list(image_batch_dict.keys()))
-        if not path_list or features_list is None:
-            return
-        for path, features in zip(path_list, features_list):
-            # 写入数据库
-            features = features.tobytes()
-            modify_time, checksum = image_batch_dict[path]
-            add_image(session, path, modify_time, checksum, features)
-            self.assets.remove(path)
+        """
+        对每个原始图片路径，调用 process_image 得到新图片路径及对应特征，
+        然后使用原始图片的 modify_time 和 checksum 写入数据库。
+        """
+        # 遍历 image_batch_dict 中的每个原始图片路径
+        for original_path, (modify_time, checksum) in image_batch_dict.items():
+            # 调用 process_image 得到新图片及对应特征
+            new_entries = process_image(original_path)
+            if new_entries is None:
+                continue
+            for new_path, feature in new_entries:
+                # 写入数据库，新图片路径、原始图片的 modify_time、checksum 和特征
+                add_image(session, new_path, modify_time, checksum, feature.tobytes())
+            # 从资产中移除原始图片路径
+            self.assets.remove(original_path)
         self.total_images = get_image_count(session)
 
     def scan(self, auto=False):
