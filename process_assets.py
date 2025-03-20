@@ -9,9 +9,7 @@ import requests
 import torch
 from PIL import Image
 from tqdm import trange
-from transformers import CLIPModel, CLIPProcessor
-from ultralytics import YOLO
-from concurrent.futures import ThreadPoolExecutor
+from transformers import ChineseCLIPProcessor, ChineseCLIPModel
 from config import *
 import whisper
 from moviepy import VideoFileClip
@@ -19,9 +17,9 @@ from moviepy import VideoFileClip
 logger = logging.getLogger(__name__)
 
 logger.info("Loading CLIP model...")
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(torch.device(DEVICE))
+clip_model = ChineseCLIPModel.from_pretrained("OFA-Sys/chinese-clip-vit-base-patch16").to(torch.device(DEVICE))
 clip_model.eval()
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip_processor = ChineseCLIPProcessor.from_pretrained("OFA-Sys/chinese-clip-vit-base-patch16")
 logger.info("CLIP model loaded.")
 
 logger.info("Loading EAST model...")
