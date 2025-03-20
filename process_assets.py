@@ -11,6 +11,8 @@ import torch
 from PIL import Image
 from tqdm import trange
 from transformers import CLIPModel, CLIPProcessor
+from ultralytics import YOLO
+from concurrent.futures import ThreadPoolExecutor
 
 from config import *
 
@@ -25,6 +27,10 @@ clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(torch.
 clip_model.eval()
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 logger.info("CLIP model loaded.")
+
+logger.info("Loading YOLOv8 model...")
+yolo_model = YOLO('yolov8s.pt')  # yolov8n/s/m/l/x
+logger.info("YOLOv8 model loaded.")
 
 whisper_model = whisper.load_model("base")
 
@@ -68,36 +74,74 @@ def get_image_data(path: str, ignore_small_images: bool = True):
 
 def process_image(path, ignore_small_images=True):
     """
-    处理图片，返回图片特征
-    :param path: string, 图片路径
-    :param ignore_small_images: bool, 是否忽略尺寸过小的图片
-    :return: <class 'numpy.nparray'>, 图片特征
+    修改后的图片处理流程：目标检测 -> 关键区域裁剪 -> 多区域特征融合
     """
+    # 读取原始图片
     image = get_image_data(path, ignore_small_images)
     if image is None:
         return None
-    feature = get_image_feature(image)
-    return feature
 
+    # 使用YOLOv8进行目标检测
+    try:
+        # 转换为RGB格式
+        yolo_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if isinstance(image, np.ndarray) else image
+        results = yolo_model(yolo_image, verbose=False)[0]  # 单图推理
+        
+        # 解析检测结果
+        boxes = results.boxes.xyxy.cpu().numpy()
+        confidences = results.boxes.conf.cpu().numpy()
+        class_ids = results.boxes.cls.cpu().numpy().astype(int)
+        
+        # 过滤设置：置信度阈值+关键类别筛选
+        DETECTION_CONF_THRESHOLD = 0.5
+        KEY_CLASSES = [0, 2, 3, 5, 7]  # person,car,motorbike,truck,bus等关键类
+        
+        valid_regions = []
+        for box, conf, cls_id in zip(boxes, confidences, class_ids):
+            if conf > DETECTION_CONF_THRESHOLD and cls_id in KEY_CLASSES:
+                # 扩展检测框范围（增加10%上下文）
+                x1, y1, x2, y2 = box
+                w = x2 - x1
+                h = y2 - y1
+                new_x1 = max(0, x1 - w * 0.1)
+                new_y1 = max(0, y1 - h * 0.1)
+                new_x2 = min(image.shape[1], x2 + w * 0.1)
+                new_y2 = min(image.shape[0], y2 + h * 0.1)
+                
+                valid_regions.append((new_x1, new_y1, new_x2, new_y2))
+    except Exception as e:
+        logger.error(f"目标检测失败: {str(e)}")
+        valid_regions = []
 
-def process_images(path_list, ignore_small_images=True):
-    """
-    处理图片，返回图片特征
-    :param path_list: string, 图片路径列表
-    :param ignore_small_images: bool, 是否忽略尺寸过小的图片
-    :return: <class 'numpy.nparray'>, 图片特征
-    """
-    images = []
-    for path in path_list.copy():
-        image = get_image_data(path, ignore_small_images)
-        if image is None:
-            path_list.remove(path)
+    # 如果没有检测到关键物体，使用整图特征
+    if not valid_regions:
+        return get_image_feature([image])[0]
+
+    # 提取多区域特征并融合
+    features = []
+    for region in valid_regions:
+        x1, y1, x2, y2 = map(int, region)
+        crop_img = image[y1:y2, x1:x2]
+        
+        # 确保裁剪区域有效
+        if crop_img.size == 0:
             continue
-        images.append(image)
-    if not images:
-        return None, None
-    feature = get_image_feature(images)
-    return path_list, feature
+            
+        # 转换为PIL格式并提取特征
+        pil_img = Image.fromarray(cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB))
+        feature = get_image_feature([pil_img])
+        if feature is not None:
+            features.append(feature[0])
+
+    # 如果没有有效特征，回退到整图
+    if not features:
+        return get_image_feature([image])[0]
+
+    # 加权融合（使用检测置信度作为权重）
+    weights = [conf for _, conf in zip(boxes, confidences)][:len(features)]
+    weighted_features = np.average(features, axis=0, weights=weights)
+    
+    return weighted_features
 
 
 def process_web_image(url):
@@ -113,6 +157,123 @@ def process_web_image(url):
         return None
     feature = get_image_feature(image)
     return feature
+
+# def process_image(path, ignore_small_images=True):
+#     """
+#     修改后的单图片处理：支持本地/网络路径的统一处理
+#     """
+#     # 统一获取图片数据
+#     if path.startswith(('http://', 'https://')):
+#         image = process_web_image(path, return_image=True)
+#     else:
+#         image = get_image_data(path, ignore_small_images)
+    
+#     if image is None:
+#         return None
+    
+#     # 执行目标检测与特征融合
+#     return detect_and_fuse_features(image)
+
+def process_images(path_list, ignore_small_images=True):
+    """
+    批量图片处理函数（无进度条版）
+    :param path_list: 图片路径列表
+    :param ignore_small_images: 是否忽略小尺寸图片
+    :return: (有效路径列表, 特征矩阵)
+    """
+    valid_paths = []
+    features = []
+    
+    # 使用线程池并行处理
+    with ThreadPoolExecutor(max_workers=IMAGE_PROCESS_WORKERS) as executor:
+        # 提交所有任务
+        futures = {
+            executor.submit(process_image, path, ignore_small_images): path
+            for path in path_list
+        }
+        
+        # 收集结果
+        for future in futures:
+            path = futures[future]
+            try:
+                feature = future.result()
+                if feature is not None:
+                    valid_paths.append(path)
+                    features.append(feature)
+            except Exception as e:
+                logger.warning(f"图片处理失败 {path}: {str(e)}")
+                continue
+    
+    return valid_paths, np.array(features) if features else None
+
+# 新增通用特征处理函数
+def detect_and_fuse_features(image):
+    """
+    统一的目标检测与特征融合管道
+    """
+    # try:
+    # 格式统一化处理
+    if isinstance(image, Image.Image):
+        image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    elif isinstance(image, np.ndarray):
+        image = image.copy()
+    else:
+        raise ValueError("不支持的图片格式")
+    
+    # 执行目标检测
+    results = yolo_model(image, verbose=False)[0]
+    boxes = results.boxes.xyxy.cpu().numpy()
+    confidences = results.boxes.conf.cpu().numpy()
+    class_ids = results.boxes.cls.cpu().numpy().astype(int)
+    
+    # 过滤并处理检测结果
+    valid_regions = []
+    for box, conf, cls_id in zip(boxes, confidences, class_ids):
+        if conf > DETECTION_CONF_THRESHOLD and cls_id in KEY_CLASSES:
+            # 动态扩展检测框（根据物体尺寸调整）
+            x1, y1, x2, y2 = box
+            w, h = x2 - x1, y2 - y1
+            expand_w = w * (0.1 + 0.05 * (1 - conf))  # 置信度越低扩展越多
+            expand_h = h * (0.1 + 0.05 * (1 - conf))
+            
+            new_box = [
+                max(0, x1 - expand_w),
+                max(0, y1 - expand_h),
+                min(image.shape[1], x2 + expand_w),
+                min(image.shape[0], y2 + expand_h)
+            ]
+            valid_regions.append((new_box, conf))
+    
+    # 多区域特征提取
+    if valid_regions:
+        features = []
+        for (x1, y1, x2, y2), conf in valid_regions:
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            
+            # 使用CLIP提取特征
+            pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            feature = get_image_feature([pil_img])
+            if feature is not None:
+                features.append(feature[0] * conf)  # 置信度加权
+        
+        # 特征融合（加权平均）
+        if features:
+            return np.mean(features, axis=0)
+    
+    # 回退到整图特征
+    pil_full = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    return get_image_feature([pil_full])[0]
+    
+    # except Exception as e:
+    #     logger.error(f"特征处理失败: {str(e)}")
+    #     # 紧急回退机制
+    #     if isinstance(image, np.ndarray):
+    #         pil_img = Image.fromarray(image)
+    #     return get_image_feature([pil_img])[0] if pil_img else None
+
 
 def extract_audio_from_video(video_path, audio_path):
     # command = [
@@ -172,8 +333,6 @@ def get_frames(video: cv2.VideoCapture):
             video.grab()  # 跳帧
     yield ids, frames
 
-
-# process_assets.py
 
 def process_video(path):
     """
@@ -257,6 +416,17 @@ def match_text_and_image_with_transcription(text_feature, image_feature, transcr
             np.linalg.norm(image_feature) * np.linalg.norm(combined_text_feature)
     )
     return score
+
+    # # 基础相似度计算
+    # base_score = (image_feature @ text_feature.T) / (
+    #     np.linalg.norm(image_feature) * np.linalg.norm(text_feature))
+    
+    # # 如果使用了目标检测特征，增加物体匹配奖励
+    # OBJECT_BONUS = 0.15  # 检测到关键物体时增加的分数
+    # if len(image_feature.shape) > 1:  # 如果使用多区域特征
+    #     base_score += OBJECT_BONUS
+    
+    # return np.clip(base_score, 0, 1)  # 确保分数在0-1之间
 
 
 def normalize_features(features):

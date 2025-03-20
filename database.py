@@ -146,8 +146,6 @@ def add_image(session: Session, path: str, modify_time: datetime.datetime, check
     session.commit()
 
 
-# database.py
-
 def add_video(session: Session, path: str, modify_time: datetime.datetime, checksum: str, frame_data_generator):
     """
     入库视频数据（修正后的版本）
